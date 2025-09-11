@@ -9,9 +9,13 @@ dependencies:
   flutter:
     sdk: flutter
   cupertino_icons: ^1.0.6
+  shared_preferences: ^2.3.2
+  intl: ^0.19.0
   google_fonts: ^6.2.1
   google_maps_flutter: ^2.9.0
   geolocator: ^9.0.2   # (optional, for real location later)
 
 flutter:
   uses-material-design: true
+  assets:
+    - assets/events.json

@@ -1,5 +1,10 @@
+import 'dart:convert';
+
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart' show rootBundle;
 import 'package:google_fonts/google_fonts.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:intl/intl.dart';
 //import 'package:google_maps_flutter/google_maps_flutter.dart';
 void main() => runApp(const NearbyApp());
 
@@ -32,6 +37,51 @@ class _ShellState extends State<Shell> {
   int _index = 0;
   final Set<String> _favourites = {}; // event ids
 
+  // NEW: hold events loaded from assets
+  List<_Event> _events = [];
+  bool _loading = true;
+  String? _loadError;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadFavourites();
+    _loadEvents();
+  }
+
+  Future<void> _loadEvents() async {
+    try {
+      final jsonStr = await rootBundle.loadString('assets/events.json');
+      final List<dynamic> data = json.decode(jsonStr) as List<dynamic>;
+      final items = data.map((e) => _Event.fromJson(e as Map<String, dynamic>)).toList()
+        ..sort((a, b) => a.start.compareTo(b.start)); // keep ascending
+      setState(() {
+        _events = items;
+        _loading = false;
+      });
+    } catch (e) {
+      setState(() {
+        _loadError = e.toString();
+        _loading = false;
+      });
+    }
+  }
+
+  Future<void> _loadFavourites() async {
+    final prefs = await SharedPreferences.getInstance();
+    final list = prefs.getStringList('favs') ?? const <String>[];
+    setState(() {
+      _favourites
+        ..clear()
+        ..addAll(list);
+    });
+  }
+
+  Future<void> _saveFavourites() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setStringList('favs', _favourites.toList());
+  }
+
   void _toggleFav(String id) {
     setState(() {
       if (_favourites.contains(id)) {
@@ -40,18 +90,37 @@ class _ShellState extends State<Shell> {
         _favourites.add(id);
       }
     });
+    _saveFavourites();
   }
 
   @override
   Widget build(BuildContext context) {
+    if (_loading) {
+      return const Scaffold(
+        body: Center(child: CircularProgressIndicator()),
+      );
+    }
+    if (_loadError != null) {
+      return Scaffold(
+        body: Center(
+          child: Padding(
+            padding: const EdgeInsets.all(24),
+            child: Text('Failed to load events: $_loadError'),
+          ),
+        ),
+      );
+    }
+
     final pages = [
       DiscoverPage(
+        events: _events,                      // ← pass events
         favourites: _favourites,
         onToggleFavourite: _toggleFav,
       ),
       FavouritesPage(
-        favourites:
-        _mockEvents.where((e) => _favourites.contains(e.id)).toList(),
+        favourites: _events
+            .where((e) => _favourites.contains(e.id))
+            .toList(),                        // ← use loaded events
         onToggleFavourite: _toggleFav,
       ),
     ];
@@ -79,11 +148,13 @@ class _ShellState extends State<Shell> {
 
 /// ---------- DISCOVER (HOME) ----------
 class DiscoverPage extends StatefulWidget {
+  final List<_Event> events;                 // ← NEW
   final Set<String> favourites;
   final void Function(String id) onToggleFavourite;
 
   const DiscoverPage({
     super.key,
+    required this.events,
     required this.favourites,
     required this.onToggleFavourite,
   });
@@ -100,13 +171,17 @@ class _DiscoverPageState extends State<DiscoverPage> {
   double _radiusKm = 5;
   Category _category = Category.all;
 
+  // search query state
+  String _query = '';
+
   @override
   Widget build(BuildContext context) {
     final filtered = _applyFilters(
-      events: _mockEvents,
+      events: widget.events,                 // ← use events from props
       timeScope: _timeScope,
       radiusKm: _radiusKm,
       category: _category,
+      query: _query,                         // ← apply search too
     );
 
     return Scaffold(
@@ -117,6 +192,19 @@ class _DiscoverPageState extends State<DiscoverPage> {
           'Near me • ${_timeScope == TimeScope.today ? "Today" : "This Week"}',
         ),
         actions: [
+          IconButton(
+            tooltip: 'Search',
+            onPressed: () async {
+              final q = await showSearch<String?>(
+                context: context,
+                delegate: _EventSearchDelegate(all: widget.events), // ← use loaded
+              );
+              if (q != null) {
+                setState(() => _query = q);
+              }
+            },
+            icon: const Icon(Icons.search),
+          ),
           IconButton(
             tooltip: 'Filters',
             onPressed: _openFilters,
@@ -141,6 +229,22 @@ class _DiscoverPageState extends State<DiscoverPage> {
               _category == Category.all ? Category.concert : Category.all;
             }),
           ),
+          const SizedBox(height: 8),
+
+          // show the active query as a chip
+          if (_query.isNotEmpty)
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 16.0),
+              child: Align(
+                alignment: Alignment.centerLeft,
+                child: InputChip(
+                  label: Text('“$_query”'),
+                  avatar: const Icon(Icons.search, size: 18),
+                  onDeleted: () => setState(() => _query = ''),
+                ),
+              ),
+            ),
+
           const SizedBox(height: 8),
           Expanded(
             child: _EventList(
@@ -182,18 +286,29 @@ class _DiscoverPageState extends State<DiscoverPage> {
     required TimeScope timeScope,
     required double radiusKm,
     required Category category,
+    String query = '',
   }) {
     final now = DateTime.now();
     final to = timeScope == TimeScope.today
         ? now.add(const Duration(days: 1))
         : now.add(const Duration(days: 7));
 
-    return events.where((e) {
+    bool matchesQuery(_Event e) {
+      if (query.isEmpty) return true;
+      final q = query.toLowerCase();
+      return e.title.toLowerCase().contains(q) ||
+          e.venue.toLowerCase().contains(q);
+    }
+
+    return events
+        .where((e) {
       final inTime = e.start.isAfter(now) && e.start.isBefore(to);
-      final inCategory = category == Category.all ? true : e.category == category;
+      final inCategory =
+      category == Category.all ? true : e.category == category;
       // radiusKm not used yet (no real coordinates) — UI-only for now
-      return inTime && inCategory;
-    }).toList()
+      return inTime && inCategory && matchesQuery(e);
+    })
+        .toList()
       ..sort((a, b) => a.start.compareTo(b.start));
   }
 }
@@ -251,7 +366,6 @@ class _MapPlaceholder extends StatelessWidget {
     );
   }
 }
-
 
 class _QuickFilterChips extends StatelessWidget {
   final TimeScope timeScope;
@@ -312,6 +426,77 @@ class _QuickFilterChips extends StatelessWidget {
           ),
         ],
       ),
+    );
+  }
+}
+
+/// Search delegate
+class _EventSearchDelegate extends SearchDelegate<String?> {
+  final List<_Event> all;
+  _EventSearchDelegate({required this.all});
+
+  @override
+  String? get searchFieldLabel => 'Search title or venue';
+
+  @override
+  List<Widget>? buildActions(BuildContext context) => [
+    if (query.isNotEmpty)
+      IconButton(
+        tooltip: 'Clear',
+        icon: const Icon(Icons.clear),
+        onPressed: () => query = '',
+      ),
+  ];
+
+  @override
+  Widget? buildLeading(BuildContext context) => IconButton(
+    tooltip: 'Back',
+    icon: const Icon(Icons.arrow_back),
+    onPressed: () => close(context, null),
+  );
+
+  @override
+  Widget buildResults(BuildContext context) {
+    final result = query.trim();
+    close(context, result.isEmpty ? null : result);
+    return const SizedBox.shrink();
+  }
+
+  @override
+  Widget buildSuggestions(BuildContext context) {
+    final q = query.toLowerCase();
+    final items = q.isEmpty
+        ? all.take(8).toList()
+        : all
+        .where((e) =>
+    e.title.toLowerCase().contains(q) ||
+        e.venue.toLowerCase().contains(q))
+        .take(20)
+        .toList();
+
+    if (items.isEmpty) {
+      return const Center(
+        child: Padding(
+          padding: EdgeInsets.all(24),
+          child: Text('No matches'),
+        ),
+      );
+    }
+
+    return ListView.separated(
+      padding: const EdgeInsets.symmetric(vertical: 8),
+      itemCount: items.length,
+      separatorBuilder: (_, __) => const Divider(height: 1),
+      itemBuilder: (_, i) {
+        final e = items[i];
+        return ListTile(
+          leading: const Icon(Icons.search),
+          title: Text(e.title, maxLines: 1, overflow: TextOverflow.ellipsis),
+          subtitle: Text('${e.venue} • ${e.city}',
+              maxLines: 1, overflow: TextOverflow.ellipsis),
+          onTap: () => close(context, e.title),
+        );
+      },
     );
   }
 }
@@ -396,19 +581,24 @@ class _EventCard extends StatelessWidget {
                 ),
                 color: Color(0xFFEAF2FF),
               ),
-              child: const Icon(Icons.event, size: 36, color: Color(0xFF5B8DEF)),
+              child:
+              const Icon(Icons.event, size: 36, color: Color(0xFF5B8DEF)),
             ),
             const SizedBox(width: 12),
             Expanded(
               child: Padding(
-                padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 4),
+                padding:
+                const EdgeInsets.symmetric(vertical: 12, horizontal: 4),
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     Text(event.title,
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
-                        style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                        style: Theme.of(context)
+                            .textTheme
+                            .titleMedium
+                            ?.copyWith(
                           fontWeight: FontWeight.w700,
                         )),
                     const SizedBox(height: 4),
@@ -504,7 +694,7 @@ class EventDetailPage extends StatelessWidget {
                 ?.copyWith(fontWeight: FontWeight.w700),
           ),
           const SizedBox(height: 8),
-          Text(
+          const Text(
             'This is a placeholder description for the event. '
                 'When we connect the backend, this will show real details, prices and links.',
           ),
@@ -716,7 +906,7 @@ class _FiltersSheetState extends State<_FiltersSheet> {
   }
 }
 
-/// ---------- MOCKS ----------
+/// ---------- MODEL ----------
 class _Event {
   final String id;
   final String title;
@@ -728,17 +918,30 @@ class _Event {
   _Event(this.id, this.title, this.venue, this.city, this.start, this.category);
 
   String get prettyTime {
-    final h = start.hour.toString().padLeft(2, '0');
-    final m = start.minute.toString().padLeft(2, '0');
-    return '${start.year}-${start.month.toString().padLeft(2, '0')}-${start.day.toString().padLeft(2, '0')}  $h:$m';
+    return DateFormat('y-MM-dd HH:mm').format(start);
+  }
+
+  factory _Event.fromJson(Map<String, dynamic> map) {
+    return _Event(
+      map['id'] as String,
+      map['title'] as String,
+      map['venue'] as String,
+      map['city'] as String,
+      DateTime.parse(map['start'] as String),
+      _categoryFromString(map['category'] as String),
+    );
+  }
+
+  static Category _categoryFromString(String v) {
+    switch (v.toLowerCase()) {
+      case 'concert':
+        return Category.concert;
+      case 'theatre':
+        return Category.theatre;
+      case 'cinema':
+        return Category.cinema;
+      default:
+        return Category.all;
+    }
   }
 }
-
-final _mockEvents = <_Event>[
-  _Event('e1', 'Concert: Mor ve Ötesi', 'Harbiye Açıkhava', 'İstanbul',
-      DateTime.now().add(const Duration(hours: 3)), Category.concert),
-  _Event('e2', 'Theatre: Bir Delinin Hatıra Defteri', 'Küçük Sahne', 'Ankara',
-      DateTime.now().add(const Duration(days: 1)), Category.theatre),
-  _Event('e3', 'Cinema: Indie Night', 'Atlas 1948', 'İstanbul',
-      DateTime.now().add(const Duration(days: 2, hours: 2)), Category.cinema),
-];
