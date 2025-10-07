@@ -1,11 +1,103 @@
 import 'dart:convert';
-
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart' show rootBundle;
+import 'package:geolocator/geolocator.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:intl/intl.dart';
-//import 'package:google_maps_flutter/google_maps_flutter.dart';
+import 'package:google_maps_flutter/google_maps_flutter.dart'; // ← move here
+import 'package:http/http.dart' as http; // ← HTTP for API calls
+
+// ---------------- Ticketmaster API config ----------------
+const _tmApiKey = 'YOUR_TICKETMASTER_API_KEY'; // ← set me!
+class EventsApi {
+  static Future<List<_Event>> fetch({
+    required double lat,
+    required double lng,
+    required double radiusKm,
+    required DateTime startUtc,
+    required DateTime endUtc,
+    int size = 50,
+  }) async {
+    String fmt(DateTime d) => d.toUtc().toIso8601String().split('.').first + 'Z';
+
+    final uri = Uri.https(
+      'app.ticketmaster.com',
+      '/discovery/v2/events.json',
+      {
+        'apikey': _tmApiKey,
+        'latlong': '$lat,$lng',
+        'radius': radiusKm.toString(),
+        'unit': 'km',
+        'locale': '*',
+        'sort': 'date,asc',
+        'size': '$size',
+        'startDateTime': fmt(startUtc),
+        'endDateTime': fmt(endUtc),
+      },
+    );
+
+    final res = await http.get(uri);
+    if (res.statusCode != 200) {
+      throw Exception('Ticketmaster error ${res.statusCode}: ${res.body}');
+    }
+    final map = json.decode(res.body) as Map<String, dynamic>;
+    final embedded = map['_embedded'] as Map<String, dynamic>?;
+    final events = embedded?['events'] as List<dynamic>? ?? const [];
+
+    return events.map<_Event>((e) {
+      final ev = e as Map<String, dynamic>;
+      final id = (ev['id'] ?? '') as String;
+      final name = (ev['name'] ?? 'Untitled') as String;
+
+      // dates
+      DateTime start = DateTime.now();
+      final dates = ev['dates'] as Map<String, dynamic>?;
+      final startMap = dates?['start'] as Map<String, dynamic>?;
+      final dt = startMap?['dateTime'] as String?;
+      if (dt != null) start = DateTime.tryParse(dt) ?? start;
+
+      // venue/city/coords
+      String venue = 'Unknown venue';
+      String city = '';
+      double? lat, lng;
+      final embedded2 = ev['_embedded'] as Map<String, dynamic>?;
+      final venues = embedded2?['venues'] as List<dynamic>? ?? const [];
+      if (venues.isNotEmpty) {
+        final v = venues.first as Map<String, dynamic>;
+        venue = (v['name'] ?? venue) as String;
+        final cityMap = v['city'] as Map<String, dynamic>?;
+        city = (cityMap?['name'] ?? '') as String;
+        final loc = v['location'] as Map<String, dynamic>?;
+        if (loc != null) {
+          lat = double.tryParse('${loc['latitude']}');
+          lng = double.tryParse('${loc['longitude']}');
+        }
+      }
+
+      // category mapping
+      Category cat = Category.all;
+      final classifications = ev['classifications'] as List<dynamic>? ?? const [];
+      if (classifications.isNotEmpty) {
+        final c = classifications.first as Map<String, dynamic>;
+        final seg = c['segment'] as Map<String, dynamic>?;
+        final segName = (seg?['name'] ?? '') as String;
+        if (segName.toLowerCase().contains('music')) {
+          cat = Category.concert;
+        } else if (segName.toLowerCase().contains('arts') ||
+            segName.toLowerCase().contains('theatre')) {
+          cat = Category.theatre;
+        } else if (segName.toLowerCase().contains('film')) {
+          cat = Category.cinema;
+        }
+      }
+
+      return _Event(id, name, venue, city, start, cat, lat: lat, lng: lng);
+    }).toList()
+      ..sort((a, b) => a.start.compareTo(b.start));
+  }
+}
+
 void main() => runApp(const NearbyApp());
 
 class NearbyApp extends StatelessWidget {
@@ -37,25 +129,56 @@ class _ShellState extends State<Shell> {
   int _index = 0;
   final Set<String> _favourites = {}; // event ids
 
-  // NEW: hold events loaded from assets
+  // Events loaded from API
   List<_Event> _events = [];
   bool _loading = true;
   String? _loadError;
+
+  // NEW: keep the current map center to refetch with user choices
+  LatLng _center = const LatLng(41.0082, 28.9784); // Istanbul default
 
   @override
   void initState() {
     super.initState();
     _loadFavourites();
-    _loadEvents();
+    _initialLoad();
   }
 
-  Future<void> _loadEvents() async {
+  Future<void> _initialLoad() async {
+    final now = DateTime.now().toUtc();
+    await _reloadFromDiscover(
+      center: _center,
+      startUtc: now,
+      endUtc: now.add(const Duration(days: 1)),
+      radiusKm: 25,
+      showSpinner: true,
+    );
+  }
+
+  // NEW: single place the Discover page can call to refetch from API
+  Future<void> _reloadFromDiscover({
+    required LatLng center,
+    required DateTime startUtc,
+    required DateTime endUtc,
+    required double radiusKm,
+    bool showSpinner = false,
+  }) async {
     try {
-      final jsonStr = await rootBundle.loadString('assets/events.json');
-      final List<dynamic> data = json.decode(jsonStr) as List<dynamic>;
-      final items = data.map((e) => _Event.fromJson(e as Map<String, dynamic>)).toList()
-        ..sort((a, b) => a.start.compareTo(b.start)); // keep ascending
+      if (showSpinner) {
+        setState(() {
+          _loading = true;
+          _loadError = null;
+        });
+      }
+      final items = await EventsApi.fetch(
+        lat: center.latitude,
+        lng: center.longitude,
+        radiusKm: radiusKm,
+        startUtc: startUtc,
+        endUtc: endUtc,
+      );
       setState(() {
+        _center = center;
         _events = items;
         _loading = false;
       });
@@ -100,7 +223,7 @@ class _ShellState extends State<Shell> {
         body: Center(child: CircularProgressIndicator()),
       );
     }
-    if (_loadError != null) {
+    if (_loadError != null && _events.isEmpty) {
       return Scaffold(
         body: Center(
           child: Padding(
@@ -113,14 +236,24 @@ class _ShellState extends State<Shell> {
 
     final pages = [
       DiscoverPage(
-        events: _events,                      // ← pass events
+        events: _events,
         favourites: _favourites,
         onToggleFavourite: _toggleFav,
+        // NEW: pass current center and a refetch callback
+        center: _center,
+        onRequestReload: (LatLng center, DateTime startUtc, DateTime endUtc, double radiusKm) {
+          _reloadFromDiscover(
+            center: center,
+            startUtc: startUtc,
+            endUtc: endUtc,
+            radiusKm: radiusKm,
+          );
+        },
       ),
       FavouritesPage(
         favourites: _events
             .where((e) => _favourites.contains(e.id))
-            .toList(),                        // ← use loaded events
+            .toList(),
         onToggleFavourite: _toggleFav,
       ),
     ];
@@ -148,15 +281,21 @@ class _ShellState extends State<Shell> {
 
 /// ---------- DISCOVER (HOME) ----------
 class DiscoverPage extends StatefulWidget {
-  final List<_Event> events;                 // ← NEW
+  final List<_Event> events;
   final Set<String> favourites;
   final void Function(String id) onToggleFavourite;
+
+  // NEW: current center & a refetch callback
+  final LatLng center;
+  final void Function(LatLng center, DateTime startUtc, DateTime endUtc, double radiusKm) onRequestReload;
 
   const DiscoverPage({
     super.key,
     required this.events,
     required this.favourites,
     required this.onToggleFavourite,
+    required this.center,
+    required this.onRequestReload,
   });
 
   @override
@@ -171,25 +310,34 @@ class _DiscoverPageState extends State<DiscoverPage> {
   double _radiusKm = 5;
   Category _category = Category.all;
 
+  // NEW: keep a local center copy so UI knows where we are
+  late LatLng _center = widget.center;
+
   // search query state
   String _query = '';
+
+  void _refetchForCurrentControls() {
+    final now = DateTime.now().toUtc();
+    final start = now;
+    final end = now.add(Duration(days: _timeScope == TimeScope.today ? 1 : 7));
+    widget.onRequestReload(_center, start, end, _radiusKm);
+  }
 
   @override
   Widget build(BuildContext context) {
     final filtered = _applyFilters(
-      events: widget.events,                 // ← use events from props
+      events: widget.events,
       timeScope: _timeScope,
       radiusKm: _radiusKm,
       category: _category,
-      query: _query,                         // ← apply search too
+      query: _query,
     );
 
     return Scaffold(
       appBar: AppBar(
         titleSpacing: 16,
         title: _LocationChip(
-          label:
-          'Near me • ${_timeScope == TimeScope.today ? "Today" : "This Week"}',
+          label: 'Near me • ${_timeScope == TimeScope.today ? "Today" : "This Week"}',
         ),
         actions: [
           IconButton(
@@ -197,7 +345,7 @@ class _DiscoverPageState extends State<DiscoverPage> {
             onPressed: () async {
               final q = await showSearch<String?>(
                 context: context,
-                delegate: _EventSearchDelegate(all: widget.events), // ← use loaded
+                delegate: _EventSearchDelegate(all: widget.events),
               );
               if (q != null) {
                 setState(() => _query = q);
@@ -214,24 +362,34 @@ class _DiscoverPageState extends State<DiscoverPage> {
       ),
       body: Column(
         children: [
-          const _MapPlaceholder(),
+          // NEW: pass center and a long-press handler to re-center & refetch
+          _EventsMap(
+            events: filtered,
+            center: _center,
+            onLongPress: (LatLng p) {
+              setState(() => _center = p);
+              _refetchForCurrentControls();
+            },
+          ),
           const SizedBox(height: 12),
           _QuickFilterChips(
             timeScope: _timeScope,
-            onTimeScopeChanged: (v) => setState(() => _timeScope = v),
+            onTimeScopeChanged: (v) {
+              setState(() => _timeScope = v);
+              _refetchForCurrentControls(); // ← refetch when scope changes
+            },
             radiusKm: _radiusKm,
-            onRadiusToggle: () => setState(() {
-              _radiusKm = _radiusKm == 5 ? 10 : 5;
-            }),
+            onRadiusToggle: () {
+              setState(() => _radiusKm = _radiusKm == 5 ? 10 : 5);
+              _refetchForCurrentControls(); // ← refetch when radius changes
+            },
             category: _category,
             onCategoryToggle: () => setState(() {
-              _category =
-              _category == Category.all ? Category.concert : Category.all;
+              _category = _category == Category.all ? Category.concert : Category.all;
             }),
           ),
           const SizedBox(height: 8),
 
-          // show the active query as a chip
           if (_query.isNotEmpty)
             Padding(
               padding: const EdgeInsets.symmetric(horizontal: 16.0),
@@ -278,6 +436,7 @@ class _DiscoverPageState extends State<DiscoverPage> {
         _radiusKm = result.radiusKm;
         _category = result.category;
       });
+      _refetchForCurrentControls(); // ← also refetch from bottom sheet apply
     }
   }
 
@@ -303,9 +462,7 @@ class _DiscoverPageState extends State<DiscoverPage> {
     return events
         .where((e) {
       final inTime = e.start.isAfter(now) && e.start.isBefore(to);
-      final inCategory =
-      category == Category.all ? true : e.category == category;
-      // radiusKm not used yet (no real coordinates) — UI-only for now
+      final inCategory = category == Category.all ? true : e.category == category;
       return inTime && inCategory && matchesQuery(e);
     })
         .toList()
@@ -321,7 +478,7 @@ class _LocationChip extends StatelessWidget {
   Widget build(BuildContext context) {
     return InkWell(
       borderRadius: BorderRadius.circular(999),
-      onTap: () {},
+      onTap: () {}, // (kept simple; long-press map to change center)
       child: Container(
         padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
         decoration: ShapeDecoration(
@@ -337,7 +494,13 @@ class _LocationChip extends StatelessWidget {
           children: [
             const Icon(Icons.my_location, size: 18),
             const SizedBox(width: 8),
-            Text(label),
+            Flexible(
+              child: Text(
+                label,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
             const SizedBox(width: 8),
             const Icon(Icons.expand_more, size: 18),
           ],
@@ -347,22 +510,116 @@ class _LocationChip extends StatelessWidget {
   }
 }
 
-class _MapPlaceholder extends StatelessWidget {
+/// --- events map widget (center + markers + long-press to move center) ---
+class _EventsMap extends StatefulWidget {
+  final List<_Event> events;
+  final LatLng center;
+  final ValueChanged<LatLng>? onLongPress;
+  const _EventsMap({
+    required this.events,
+    required this.center,
+    this.onLongPress,
+  });
+
+  @override
+  State<_EventsMap> createState() => _EventsMapState();
+}
+
+class _EventsMapState extends State<_EventsMap> {
+  GoogleMapController? _controller;
+
+  @override
+  Widget build(BuildContext context) {
+    final eventMarkers = widget.events
+        .where((e) => e.lat != null && e.lng != null)
+        .map((e) => Marker(
+      markerId: MarkerId(e.id),
+      position: LatLng(e.lat!, e.lng!),
+      infoWindow: InfoWindow(title: e.title, snippet: e.venue),
+    ));
+
+    // marker to show the chosen center
+    final centerMarker = Marker(
+      markerId: const MarkerId('center'),
+      position: widget.center,
+      icon: BitmapDescriptor.defaultMarkerWithHue(BitmapDescriptor.hueAzure),
+      infoWindow: const InfoWindow(title: 'Selected center'),
+    );
+
+    final markers = <Marker>{centerMarker, ...eventMarkers};
+
+    return Container(
+      margin: const EdgeInsets.fromLTRB(16, 12, 16, 0),
+      height: 180,
+      clipBehavior: Clip.antiAlias,
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(16),
+      ),
+      child: GoogleMap(
+        initialCameraPosition:
+        CameraPosition(target: widget.center, zoom: 12.0),
+        markers: markers,
+        myLocationButtonEnabled: false,
+        zoomControlsEnabled: false,
+        onMapCreated: (c) {
+          _controller = c;
+          // ensure we center on the provided point
+          _controller!.moveCamera(CameraUpdate.newLatLng(widget.center));
+        },
+        onLongPress: widget.onLongPress, // ← pick new center
+      ),
+    );
+  }
+
+  @override
+  void didUpdateWidget(covariant _EventsMap oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (_controller != null && oldWidget.center != widget.center) {
+      _controller!.animateCamera(CameraUpdate.newLatLng(widget.center));
+    }
+  }
+}
+
+class _MapPlaceholder extends StatefulWidget {
   const _MapPlaceholder();
+  @override
+  State<_MapPlaceholder> createState() => _MapRealState();
+}
+
+class _MapRealState extends State<_MapPlaceholder> {
+  GoogleMapController? _controller;
+
+  static const _istanbul = LatLng(41.0082, 28.9784);
+  final Set<Marker> _markers = {
+    const Marker(
+      markerId: MarkerId('concert'),
+      position: LatLng(41.0411, 28.9862),
+      infoWindow: InfoWindow(title: 'Concert: Mor ve Ötesi'),
+    ),
+    const Marker(
+      markerId: MarkerId('cinema'),
+      position: LatLng(41.0369, 28.9768),
+      infoWindow: InfoWindow(title: 'Cinema: Indie Night'),
+    ),
+  };
+
   @override
   Widget build(BuildContext context) {
     return Container(
       margin: const EdgeInsets.fromLTRB(16, 12, 16, 0),
       height: 180,
+      clipBehavior: Clip.antiAlias,
       decoration: BoxDecoration(
         borderRadius: BorderRadius.circular(16),
-        gradient: const LinearGradient(
-          colors: [Color(0xFFB9D6FF), Color(0xFFEEF4FF)],
-          begin: Alignment.topLeft,
-          end: Alignment.bottomRight,
-        ),
       ),
-      child: const Center(child: Text('Map placeholder')),
+      child: GoogleMap(
+        initialCameraPosition:
+        const CameraPosition(target: _istanbul, zoom: 12.0),
+        markers: _markers,
+        myLocationButtonEnabled: false,
+        zoomControlsEnabled: false,
+        onMapCreated: (c) => _controller = c,
+      ),
     );
   }
 }
@@ -617,7 +874,13 @@ class _EventCard extends StatelessWidget {
                       children: [
                         const Icon(Icons.schedule, size: 16),
                         const SizedBox(width: 4),
-                        Text(event.prettyTime),
+                        Flexible(
+                          child: Text(
+                            event.prettyTime,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ),
                       ],
                     ),
                   ],
@@ -811,7 +1074,7 @@ class _FiltersSheetState extends State<_FiltersSheet> {
   Widget build(BuildContext context) {
     return Padding(
       padding:
-      EdgeInsets.only(bottom: MediaQuery.of(context).viewInsets.bottom),
+      EdgeInsets.only(bottom: MediaStore.of(context).viewInsets.bottom),
       child: SingleChildScrollView(
         padding: const EdgeInsets.fromLTRB(24, 12, 24, 24),
         child: Column(
@@ -914,12 +1177,21 @@ class _Event {
   final String city;
   final DateTime start;
   final Category category;
+  final double? lat;
+  final double? lng;
 
-  _Event(this.id, this.title, this.venue, this.city, this.start, this.category);
+  _Event(
+      this.id,
+      this.title,
+      this.venue,
+      this.city,
+      this.start,
+      this.category, {
+        this.lat,
+        this.lng,
+      });
 
-  String get prettyTime {
-    return DateFormat('y-MM-dd HH:mm').format(start);
-  }
+  String get prettyTime => DateFormat('y-MM-dd HH:mm').format(start);
 
   factory _Event.fromJson(Map<String, dynamic> map) {
     return _Event(
@@ -929,6 +1201,8 @@ class _Event {
       map['city'] as String,
       DateTime.parse(map['start'] as String),
       _categoryFromString(map['category'] as String),
+      lat: (map['lat'] as num?)?.toDouble(),
+      lng: (map['lng'] as num?)?.toDouble(),
     );
   }
 
