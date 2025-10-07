@@ -9,7 +9,7 @@ import 'package:google_maps_flutter/google_maps_flutter.dart'; // ← move here
 import 'package:http/http.dart' as http; // ← HTTP for API calls
 
 // ---------------- Ticketmaster API config ----------------
-const _tmApiKey = 'YOUR_TICKETMASTER_API_KEY'; // ← set me!
+const _tmApiKey = 'DPgryaAxglzAhUlQuRjbGOpsCLGGjEEB'; // ← set me!
 class EventsApi {
   static Future<List<_Event>> fetch({
     required double lat,
@@ -27,7 +27,7 @@ class EventsApi {
       {
         'apikey': _tmApiKey,
         'latlong': '$lat,$lng',
-        'radius': radiusKm.toString(),
+        'radius': radiusKm.round().clamp(1, 19999).toString(),
         'unit': 'km',
         'locale': '*',
         'sort': 'date,asc',
@@ -323,6 +323,19 @@ class _DiscoverPageState extends State<DiscoverPage> {
     widget.onRequestReload(_center, start, end, _radiusKm);
   }
 
+  Future<void> _openChooseLocation() async {
+    final picked = await Navigator.of(context).push<LatLng>(
+      MaterialPageRoute(
+        builder: (_) => ChooseLocationPage(initialCenter: _center),
+        fullscreenDialog: true,
+      ),
+    );
+    if (picked != null) {
+      setState(() => _center = picked);
+      _refetchForCurrentControls();
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final filtered = _applyFilters(
@@ -338,6 +351,7 @@ class _DiscoverPageState extends State<DiscoverPage> {
         titleSpacing: 16,
         title: _LocationChip(
           label: 'Near me • ${_timeScope == TimeScope.today ? "Today" : "This Week"}',
+          onTap: _openChooseLocation, // ← open full-screen picker
         ),
         actions: [
           IconButton(
@@ -472,13 +486,14 @@ class _DiscoverPageState extends State<DiscoverPage> {
 
 class _LocationChip extends StatelessWidget {
   final String label;
-  const _LocationChip({required this.label});
+  final VoidCallback? onTap;
+  const _LocationChip({required this.label, this.onTap});
 
   @override
   Widget build(BuildContext context) {
     return InkWell(
       borderRadius: BorderRadius.circular(999),
-      onTap: () {}, // (kept simple; long-press map to change center)
+      onTap: onTap, // ← opens picker
       child: Container(
         padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
         decoration: ShapeDecoration(
@@ -1074,7 +1089,7 @@ class _FiltersSheetState extends State<_FiltersSheet> {
   Widget build(BuildContext context) {
     return Padding(
       padding:
-      EdgeInsets.only(bottom: MediaStore.of(context).viewInsets.bottom),
+      EdgeInsets.only(bottom: MediaQuery.of(context).viewInsets.bottom),
       child: SingleChildScrollView(
         padding: const EdgeInsets.fromLTRB(24, 12, 24, 24),
         child: Column(
@@ -1217,5 +1232,171 @@ class _Event {
       default:
         return Category.all;
     }
+  }
+}
+
+/// ---------- CHOOSE LOCATION (full-screen picker) ----------
+class ChooseLocationPage extends StatefulWidget {
+  final LatLng initialCenter;
+  const ChooseLocationPage({super.key, required this.initialCenter});
+
+  @override
+  State<ChooseLocationPage> createState() => _ChooseLocationPageState();
+}
+
+class _ChooseLocationPageState extends State<ChooseLocationPage> {
+  late LatLng _center = widget.initialCenter;
+  GoogleMapController? _controller;
+  final _text = TextEditingController();
+  bool _busy = false;
+
+  Future<void> _goToCurrentLocation() async {
+    try {
+      bool serviceEnabled = await Geolocator.isLocationServiceEnabled();
+      if (!serviceEnabled) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Location services are disabled.')),
+        );
+        return;
+      }
+      LocationPermission permission = await Geolocator.checkPermission();
+      if (permission == LocationPermission.denied) {
+        permission = await Geolocator.requestPermission();
+      }
+      if (permission == LocationPermission.denied ||
+          permission == LocationPermission.deniedForever) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Location permission denied.')),
+        );
+        return;
+      }
+      final pos = await Geolocator.getCurrentPosition();
+      final p = LatLng(pos.latitude, pos.longitude);
+      setState(() => _center = p);
+      _controller?.animateCamera(CameraUpdate.newLatLngZoom(p, 12));
+    } catch (e) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Location error: $e')),
+      );
+    }
+  }
+
+  Future<void> _searchPlace() async {
+    final query = _text.text.trim();
+    if (query.isEmpty) return;
+    setState(() => _busy = true);
+    try {
+      // Use OpenStreetMap Nominatim (no key needed) to geocode the query.
+      final uri = Uri.https('nominatim.openstreetmap.org', '/search', {
+        'q': query,
+        'format': 'json',
+        'limit': '1',
+      });
+      final res = await http.get(uri, headers: {
+        'User-Agent': 'NearbyEvents/1.0 (flutter app)',
+      });
+      if (res.statusCode == 200) {
+        final list = json.decode(res.body) as List<dynamic>;
+        if (list.isNotEmpty) {
+          final m = list.first as Map<String, dynamic>;
+          final lat = double.tryParse(m['lat'] as String? ?? '');
+          final lon = double.tryParse(m['lon'] as String? ?? '');
+          if (lat != null && lon != null) {
+            final p = LatLng(lat, lon);
+            setState(() => _center = p);
+            _controller?.animateCamera(CameraUpdate.newLatLngZoom(p, 12));
+          } else {
+            _showSnack('No coordinates found for “$query”.');
+          }
+        } else {
+          _showSnack('No results for “$query”.');
+        }
+      } else {
+        _showSnack('Search failed (${res.statusCode}).');
+      }
+    } catch (e) {
+      _showSnack('Search error: $e');
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  void _showSnack(String msg) {
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final markers = <Marker>{
+      Marker(
+        markerId: const MarkerId('center'),
+        position: _center,
+        infoWindow: const InfoWindow(title: 'Selected location'),
+      )
+    };
+
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Choose location'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(_center),
+            child: const Text('Use'),
+          ),
+        ],
+      ),
+      body: Stack(
+        children: [
+          GoogleMap(
+            initialCameraPosition: CameraPosition(target: _center, zoom: 12),
+            markers: markers,
+            onMapCreated: (c) => _controller = c,
+            onLongPress: (p) {
+              setState(() => _center = p);
+              _controller?.animateCamera(CameraUpdate.newLatLng(p));
+            },
+            myLocationButtonEnabled: false,
+            zoomControlsEnabled: false,
+          ),
+          SafeArea(
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(12, 12, 12, 0),
+              child: Material(
+                elevation: 2,
+                borderRadius: BorderRadius.circular(12),
+                child: Row(
+                  children: [
+                    const SizedBox(width: 8),
+                    const Icon(Icons.search),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: TextField(
+                        controller: _text,
+                        decoration: const InputDecoration(
+                          hintText: 'Search a place…',
+                          border: InputBorder.none,
+                        ),
+                        textInputAction: TextInputAction.search,
+                        onSubmitted: (_) => _searchPlace(),
+                      ),
+                    ),
+                    IconButton(
+                      tooltip: 'Search',
+                      onPressed: _busy ? null : _searchPlace,
+                      icon: const Icon(Icons.arrow_forward),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+      floatingActionButton: FloatingActionButton.extended(
+        onPressed: _goToCurrentLocation,
+        icon: const Icon(Icons.my_location),
+        label: const Text('My location'),
+      ),
+    );
   }
 }
