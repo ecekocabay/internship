@@ -7,6 +7,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:intl/intl.dart';
 import 'package:google_maps_flutter/google_maps_flutter.dart'; // ← move here
 import 'package:http/http.dart' as http; // ← HTTP for API calls
+import 'package:url_launcher/url_launcher.dart'; // ← NEW: open Ticketmaster links
 
 // ---------------- Ticketmaster API config ----------------
 const _tmApiKey = 'DPgryaAxglzAhUlQuRjbGOpsCLGGjEEB'; // ← set me!
@@ -92,7 +93,10 @@ class EventsApi {
         }
       }
 
-      return _Event(id, name, venue, city, start, cat, lat: lat, lng: lng);
+      // NEW: Ticketmaster event url
+      final url = (ev['url'] ?? '') as String?;
+
+      return _Event(id, name, venue, city, start, cat, lat: lat, lng: lng, url: url);
     }).toList()
       ..sort((a, b) => a.start.compareTo(b.start));
   }
@@ -323,19 +327,6 @@ class _DiscoverPageState extends State<DiscoverPage> {
     widget.onRequestReload(_center, start, end, _radiusKm);
   }
 
-  Future<void> _openChooseLocation() async {
-    final picked = await Navigator.of(context).push<LatLng>(
-      MaterialPageRoute(
-        builder: (_) => ChooseLocationPage(initialCenter: _center),
-        fullscreenDialog: true,
-      ),
-    );
-    if (picked != null) {
-      setState(() => _center = picked);
-      _refetchForCurrentControls();
-    }
-  }
-
   @override
   Widget build(BuildContext context) {
     final filtered = _applyFilters(
@@ -351,7 +342,6 @@ class _DiscoverPageState extends State<DiscoverPage> {
         titleSpacing: 16,
         title: _LocationChip(
           label: 'Near me • ${_timeScope == TimeScope.today ? "Today" : "This Week"}',
-          onTap: _openChooseLocation, // ← open full-screen picker
         ),
         actions: [
           IconButton(
@@ -486,14 +476,13 @@ class _DiscoverPageState extends State<DiscoverPage> {
 
 class _LocationChip extends StatelessWidget {
   final String label;
-  final VoidCallback? onTap;
-  const _LocationChip({required this.label, this.onTap});
+  const _LocationChip({required this.label});
 
   @override
   Widget build(BuildContext context) {
     return InkWell(
       borderRadius: BorderRadius.circular(999),
-      onTap: onTap, // ← opens picker
+      onTap: () {}, // (kept simple; long-press map to change center)
       child: Container(
         padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
         decoration: ShapeDecoration(
@@ -729,8 +718,11 @@ class _EventSearchDelegate extends SearchDelegate<String?> {
 
   @override
   Widget buildResults(BuildContext context) {
+    // Defer closing to the next frame to avoid "setState during build" errors.
     final result = query.trim();
-    close(context, result.isEmpty ? null : result);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      close(context, result.isEmpty ? null : result);
+    });
     return const SizedBox.shrink();
   }
 
@@ -825,7 +817,13 @@ class _EventCard extends StatelessWidget {
       borderRadius: BorderRadius.circular(16),
       onTap: () {
         Navigator.of(context).push(
-          MaterialPageRoute(builder: (_) => EventDetailPage(event: event)),
+          MaterialPageRoute(
+            builder: (_) => EventDetailPage(
+              event: event,
+              isFavourite: isFavourite,
+              onToggleFavourite: onToggleFavourite,
+            ),
+          ),
         );
       },
       child: Container(
@@ -920,13 +918,65 @@ class _EventCard extends StatelessWidget {
 }
 
 /// ---------- EVENT DETAIL ----------
-class EventDetailPage extends StatelessWidget {
+/// ---------- EVENT DETAIL ----------
+class EventDetailPage extends StatefulWidget {
   final _Event event;
-  const EventDetailPage({super.key, required this.event});
+  final bool isFavourite;
+  final void Function(String id) onToggleFavourite;
+
+  const EventDetailPage({
+    super.key,
+    required this.event,
+    required this.isFavourite,
+    required this.onToggleFavourite,
+  });
+
+  @override
+  State<EventDetailPage> createState() => _EventDetailPageState();
+}
+
+class _EventDetailPageState extends State<EventDetailPage> {
+  late bool _isFav = widget.isFavourite;
+
+  Future<void> _openTickets(String? url, BuildContext context) async {
+    if (url == null || url.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('No ticket link available for this event.')),
+      );
+      return;
+    }
+    final uri = Uri.parse(url);
+    try {
+      if (await canLaunchUrl(uri)) {
+        await launchUrl(uri, mode: LaunchMode.externalApplication);
+      } else {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Could not open: $url')),
+        );
+      }
+    } catch (e) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Failed to open: $e')),
+      );
+    }
+  }
+
+  void _toggleFav() {
+    widget.onToggleFavourite(widget.event.id);
+    setState(() => _isFav = !_isFav);
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(_isFav ? 'Added to favourites' : 'Removed from favourites'),
+        duration: const Duration(seconds: 1),
+      ),
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
+    final event = widget.event;
+
     return Scaffold(
       appBar: AppBar(title: const Text('Event details')),
       body: ListView(
@@ -947,10 +997,12 @@ class EventDetailPage extends StatelessWidget {
             ),
           ),
           const SizedBox(height: 16),
-          Text(event.title,
-              style: Theme.of(context).textTheme.headlineSmall?.copyWith(
-                fontWeight: FontWeight.w800,
-              )),
+          Text(
+            event.title,
+            style: Theme.of(context).textTheme.headlineSmall?.copyWith(
+              fontWeight: FontWeight.w800,
+            ),
+          ),
           const SizedBox(height: 8),
           Row(children: [
             const Icon(Icons.place, size: 18),
@@ -963,36 +1015,33 @@ class EventDetailPage extends StatelessWidget {
             const SizedBox(width: 6),
             Text(event.prettyTime),
           ]),
-          const SizedBox(height: 16),
-          Text(
-            'About',
-            style: Theme.of(context)
-                .textTheme
-                .titleMedium
-                ?.copyWith(fontWeight: FontWeight.w700),
-          ),
-          const SizedBox(height: 8),
-          const Text(
-            'This is a placeholder description for the event. '
-                'When we connect the backend, this will show real details, prices and links.',
-          ),
+
           const SizedBox(height: 24),
+
+          // Open Ticketmaster page
           FilledButton.icon(
             icon: const Icon(Icons.confirmation_number),
             label: const Text('Get Tickets'),
-            onPressed: () {},
+            onPressed: event.url == null || event.url!.isEmpty
+                ? null
+                : () => _openTickets(event.url, context),
           ),
           const SizedBox(height: 12),
+
+          // Favourites button (now works)
           OutlinedButton.icon(
-            icon: const Icon(Icons.favorite_border),
-            label: const Text('Add to Favourites'),
-            onPressed: () {},
+            icon: Icon(_isFav ? Icons.favorite : Icons.favorite_border),
+            label: Text(_isFav ? 'Remove from Favourites' : 'Add to Favourites'),
+            onPressed: _toggleFav,
           ),
+
           const SizedBox(height: 12),
           TextButton.icon(
             icon: const Icon(Icons.link),
             label: const Text('Open Source Link'),
-            onPressed: () {},
+            onPressed: event.url == null || event.url!.isEmpty
+                ? null
+                : () => _openTickets(event.url, context),
           ),
         ],
       ),
@@ -1194,6 +1243,7 @@ class _Event {
   final Category category;
   final double? lat;
   final double? lng;
+  final String? url; // ← NEW: Ticketmaster URL
 
   _Event(
       this.id,
@@ -1204,6 +1254,7 @@ class _Event {
       this.category, {
         this.lat,
         this.lng,
+        this.url, // ← NEW
       });
 
   String get prettyTime => DateFormat('y-MM-dd HH:mm').format(start);
@@ -1218,6 +1269,7 @@ class _Event {
       _categoryFromString(map['category'] as String),
       lat: (map['lat'] as num?)?.toDouble(),
       lng: (map['lng'] as num?)?.toDouble(),
+      url: map['url'] as String?, // ← keep compatible if present
     );
   }
 
@@ -1232,171 +1284,5 @@ class _Event {
       default:
         return Category.all;
     }
-  }
-}
-
-/// ---------- CHOOSE LOCATION (full-screen picker) ----------
-class ChooseLocationPage extends StatefulWidget {
-  final LatLng initialCenter;
-  const ChooseLocationPage({super.key, required this.initialCenter});
-
-  @override
-  State<ChooseLocationPage> createState() => _ChooseLocationPageState();
-}
-
-class _ChooseLocationPageState extends State<ChooseLocationPage> {
-  late LatLng _center = widget.initialCenter;
-  GoogleMapController? _controller;
-  final _text = TextEditingController();
-  bool _busy = false;
-
-  Future<void> _goToCurrentLocation() async {
-    try {
-      bool serviceEnabled = await Geolocator.isLocationServiceEnabled();
-      if (!serviceEnabled) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Location services are disabled.')),
-        );
-        return;
-      }
-      LocationPermission permission = await Geolocator.checkPermission();
-      if (permission == LocationPermission.denied) {
-        permission = await Geolocator.requestPermission();
-      }
-      if (permission == LocationPermission.denied ||
-          permission == LocationPermission.deniedForever) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Location permission denied.')),
-        );
-        return;
-      }
-      final pos = await Geolocator.getCurrentPosition();
-      final p = LatLng(pos.latitude, pos.longitude);
-      setState(() => _center = p);
-      _controller?.animateCamera(CameraUpdate.newLatLngZoom(p, 12));
-    } catch (e) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Location error: $e')),
-      );
-    }
-  }
-
-  Future<void> _searchPlace() async {
-    final query = _text.text.trim();
-    if (query.isEmpty) return;
-    setState(() => _busy = true);
-    try {
-      // Use OpenStreetMap Nominatim (no key needed) to geocode the query.
-      final uri = Uri.https('nominatim.openstreetmap.org', '/search', {
-        'q': query,
-        'format': 'json',
-        'limit': '1',
-      });
-      final res = await http.get(uri, headers: {
-        'User-Agent': 'NearbyEvents/1.0 (flutter app)',
-      });
-      if (res.statusCode == 200) {
-        final list = json.decode(res.body) as List<dynamic>;
-        if (list.isNotEmpty) {
-          final m = list.first as Map<String, dynamic>;
-          final lat = double.tryParse(m['lat'] as String? ?? '');
-          final lon = double.tryParse(m['lon'] as String? ?? '');
-          if (lat != null && lon != null) {
-            final p = LatLng(lat, lon);
-            setState(() => _center = p);
-            _controller?.animateCamera(CameraUpdate.newLatLngZoom(p, 12));
-          } else {
-            _showSnack('No coordinates found for “$query”.');
-          }
-        } else {
-          _showSnack('No results for “$query”.');
-        }
-      } else {
-        _showSnack('Search failed (${res.statusCode}).');
-      }
-    } catch (e) {
-      _showSnack('Search error: $e');
-    } finally {
-      if (mounted) setState(() => _busy = false);
-    }
-  }
-
-  void _showSnack(String msg) {
-    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final markers = <Marker>{
-      Marker(
-        markerId: const MarkerId('center'),
-        position: _center,
-        infoWindow: const InfoWindow(title: 'Selected location'),
-      )
-    };
-
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('Choose location'),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.of(context).pop(_center),
-            child: const Text('Use'),
-          ),
-        ],
-      ),
-      body: Stack(
-        children: [
-          GoogleMap(
-            initialCameraPosition: CameraPosition(target: _center, zoom: 12),
-            markers: markers,
-            onMapCreated: (c) => _controller = c,
-            onLongPress: (p) {
-              setState(() => _center = p);
-              _controller?.animateCamera(CameraUpdate.newLatLng(p));
-            },
-            myLocationButtonEnabled: false,
-            zoomControlsEnabled: false,
-          ),
-          SafeArea(
-            child: Padding(
-              padding: const EdgeInsets.fromLTRB(12, 12, 12, 0),
-              child: Material(
-                elevation: 2,
-                borderRadius: BorderRadius.circular(12),
-                child: Row(
-                  children: [
-                    const SizedBox(width: 8),
-                    const Icon(Icons.search),
-                    const SizedBox(width: 8),
-                    Expanded(
-                      child: TextField(
-                        controller: _text,
-                        decoration: const InputDecoration(
-                          hintText: 'Search a place…',
-                          border: InputBorder.none,
-                        ),
-                        textInputAction: TextInputAction.search,
-                        onSubmitted: (_) => _searchPlace(),
-                      ),
-                    ),
-                    IconButton(
-                      tooltip: 'Search',
-                      onPressed: _busy ? null : _searchPlace,
-                      icon: const Icon(Icons.arrow_forward),
-                    ),
-                  ],
-                ),
-              ),
-            ),
-          ),
-        ],
-      ),
-      floatingActionButton: FloatingActionButton.extended(
-        onPressed: _goToCurrentLocation,
-        icon: const Icon(Icons.my_location),
-        label: const Text('My location'),
-      ),
-    );
   }
 }
