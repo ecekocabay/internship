@@ -344,8 +344,23 @@ class _DiscoverPageState extends State<DiscoverPage> {
           label: 'Near me • ${_timeScope == TimeScope.today ? "Today" : "This Week"}',
         ),
         actions: [
+          // NEW: place search button (by name)
           IconButton(
-            tooltip: 'Search',
+            tooltip: 'Search place',
+            icon: const Icon(Icons.place_outlined),
+            onPressed: () async {
+              final picked = await showSearch<LatLng?>(
+                context: context,
+                delegate: _PlaceSearchDelegate(),
+              );
+              if (picked != null) {
+                setState(() => _center = picked);
+                _refetchForCurrentControls();
+              }
+            },
+          ),
+          IconButton(
+            tooltip: 'Search events',
             onPressed: () async {
               final q = await showSearch<String?>(
                 context: context,
@@ -691,7 +706,7 @@ class _QuickFilterChips extends StatelessWidget {
   }
 }
 
-/// Search delegate
+/// Search delegate (EVENTS)
 class _EventSearchDelegate extends SearchDelegate<String?> {
   final List<_Event> all;
   _EventSearchDelegate({required this.all});
@@ -763,6 +778,110 @@ class _EventSearchDelegate extends SearchDelegate<String?> {
       },
     );
   }
+}
+
+/// Search delegate (PLACES via Nominatim)
+class _PlaceSearchDelegate extends SearchDelegate<LatLng?> {
+  Future<List<_PlaceHit>> _search(String q) async {
+    if (q.trim().isEmpty) return const [];
+    final uri = Uri.https('nominatim.openstreetmap.org', '/search', {
+      'q': q,
+      'format': 'jsonv2',
+      'limit': '10',
+    });
+    final res = await http.get(uri, headers: {
+      'User-Agent': 'nearby-events-app/1.0 (example@example.com)'
+    });
+    if (res.statusCode != 200) return const [];
+    final data = json.decode(res.body) as List<dynamic>;
+    return data.map<_PlaceHit>((e) {
+      final m = e as Map<String, dynamic>;
+      final name = (m['display_name'] ?? '') as String;
+      final lat = double.tryParse(m['lat'] ?? '');
+      final lon = double.tryParse(m['lon'] ?? '');
+      return _PlaceHit(
+        title: name,
+        coord: (lat != null && lon != null) ? LatLng(lat, lon) : null,
+      );
+    }).where((h) => h.coord != null).toList();
+  }
+
+  @override
+  String? get searchFieldLabel => 'Search a place (city, venue...)';
+
+  @override
+  List<Widget>? buildActions(BuildContext context) => [
+    if (query.isNotEmpty)
+      IconButton(
+        tooltip: 'Clear',
+        icon: const Icon(Icons.clear),
+        onPressed: () => query = '',
+      )
+  ];
+
+  @override
+  Widget? buildLeading(BuildContext context) => IconButton(
+    icon: const Icon(Icons.arrow_back),
+    onPressed: () => close(context, null),
+  );
+
+  @override
+  Widget buildResults(BuildContext context) {
+    // We simply rely on suggestion tap to return a result.
+    return const SizedBox.shrink();
+  }
+
+  @override
+  Widget buildSuggestions(BuildContext context) {
+    if (query.trim().length < 2) {
+      return const Center(
+        child: Padding(
+          padding: EdgeInsets.all(24),
+          child: Text('Type at least 2 characters'),
+        ),
+      );
+    }
+    return FutureBuilder<List<_PlaceHit>>(
+      future: _search(query),
+      builder: (context, snap) {
+        if (snap.connectionState == ConnectionState.waiting) {
+          return const Center(child: Padding(
+            padding: EdgeInsets.all(24),
+            child: CircularProgressIndicator(),
+          ));
+        }
+        final items = snap.data ?? const [];
+        if (items.isEmpty) {
+          return const Center(child: Padding(
+            padding: EdgeInsets.all(24),
+            child: Text('No places found'),
+          ));
+        }
+        return ListView.separated(
+          itemCount: items.length,
+          separatorBuilder: (_, __) => const Divider(height: 1),
+          itemBuilder: (_, i) {
+            final h = items[i];
+            return ListTile(
+              leading: const Icon(Icons.place),
+              title: Text(
+                h.title,
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+              ),
+              onTap: () => close(context, h.coord),
+            );
+          },
+        );
+      },
+    );
+  }
+}
+
+class _PlaceHit {
+  final String title;
+  final LatLng? coord;
+  _PlaceHit({required this.title, required this.coord});
 }
 
 class _EventList extends StatelessWidget {
@@ -918,7 +1037,6 @@ class _EventCard extends StatelessWidget {
 }
 
 /// ---------- EVENT DETAIL ----------
-/// ---------- EVENT DETAIL ----------
 class EventDetailPage extends StatefulWidget {
   final _Event event;
   final bool isFavourite;
@@ -966,7 +1084,8 @@ class _EventDetailPageState extends State<EventDetailPage> {
     setState(() => _isFav = !_isFav);
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
-        content: Text(_isFav ? 'Added to favourites' : 'Removed from favourites'),
+        content:
+        Text(_isFav ? 'Added to favourites' : 'Removed from favourites'),
         duration: const Duration(seconds: 1),
       ),
     );
@@ -1015,10 +1134,7 @@ class _EventDetailPageState extends State<EventDetailPage> {
             const SizedBox(width: 6),
             Text(event.prettyTime),
           ]),
-
           const SizedBox(height: 24),
-
-          // Open Ticketmaster page
           FilledButton.icon(
             icon: const Icon(Icons.confirmation_number),
             label: const Text('Get Tickets'),
@@ -1027,14 +1143,12 @@ class _EventDetailPageState extends State<EventDetailPage> {
                 : () => _openTickets(event.url, context),
           ),
           const SizedBox(height: 12),
-
-          // Favourites button (now works)
           OutlinedButton.icon(
             icon: Icon(_isFav ? Icons.favorite : Icons.favorite_border),
-            label: Text(_isFav ? 'Remove from Favourites' : 'Add to Favourites'),
+            label:
+            Text(_isFav ? 'Remove from Favourites' : 'Add to Favourites'),
             onPressed: _toggleFav,
           ),
-
           const SizedBox(height: 12),
           TextButton.icon(
             icon: const Icon(Icons.link),
